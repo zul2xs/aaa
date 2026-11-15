@@ -1,122 +1,62 @@
 #!/usr/bin/env bash
 
-# 当前脚本版本号 (双节点定制版)
-VERSION='v1.3.30-dual (2026.11.15)'
+# 确保以 root 权限运行
+[ "$(id -u)" != 0 ] && echo "错误：必须以 root 权限运行此脚本！" && exit 1
 
-# 各变量默认值
-TEMP_DIR='/tmp/sing-box'
-WORK_DIR='/etc/sing-box'
-START_PORT_DEFAULT='8881'
-MIN_PORT=100
-MAX_PORT=65520
-DEFAULT_NEWEST_VERSION='1.15.0'
+WORK_DIR="/etc/sing-box"
+mkdir -p "$WORK_DIR"
 
-# 仅保留两个核心节点
-PROTOCOL_LIST=("vless + reality" "hysteria2")
-NODE_TAG=("vless-reality" "hysteria2")
+echo "========================================="
+echo "   Sing-box 双节点 (Reality + Hy2) 安装"
+echo "========================================="
 
-export DEBIAN_FRONTEND=noninteractive
+# 1. 获取服务器 IP（支持自动检测并允许手动修改）
+AUTO_IP=$(curl -s https://ip.sb || curl -s https://api.ipify.org)
+read -p "请输入或确认服务器公网 IP [默认: ${AUTO_IP}]: " SERVER_IP
+SERVER_IP=${SERVER_IP:-$AUTO_IP}
 
-cleanup_temp() {
-  rm -rf "$TEMP_DIR"
-}
+# 2. 输入端口
+read -p "请输入 VLESS-Reality 端口 [默认: 8443]: " REALITY_PORT
+REALITY_PORT=${REALITY_PORT:-8443}
 
-trap cleanup_temp EXIT
-trap 'cleanup_temp; printf "\n"; exit 1' INT QUIT TERM
-mkdir -p "$TEMP_DIR"
+read -p "请输入 Hysteria2 端口 [默认: 8444]: " HY2_PORT
+HY2_PORT=${HY2_PORT:-8444}
 
-warning() { echo -e "\033[31m\033[01m$*\033[0m"; }
-error() { echo -e "\033[31m\033[01m$*\033[0m" && exit 1; }
-info() { echo -e "\033[32m\033[01m$*\033[0m"; }
-hint() { echo -e "\033[33m\033[01m$*\033[0m"; }
+# 3. 检查系统架构并下载安装 sing-box
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64|amd64) SING_ARCH="amd64" ;;
+    aarch64|arm64) SING_ARCH="arm64" ;;
+    *) echo "错误：不支持的架构: $ARCH"; exit 1 ;;
+esac
 
-check_root() {
-  [ "$(id -u)" != 0 ] && error "\n 必须以 root 方式运行此脚本 \n"
-}
+echo "正在下载并安装 sing-box..."
+LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+LATEST_VER=${LATEST_VER:-1.10.0}
+DL_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-${SING_ARCH}.tar.gz"
 
-check_system_info() {
-  [ -s /etc/os-release ] && SYS="$(awk -F '"' 'tolower($0) ~ /pretty_name/{print $2}' /etc/os-release)"
-  SYSTEM='Debian'
-  if grep -qi 'ubuntu' <<< "$SYS"; then SYSTEM='Ubuntu'; fi
-  if grep -qi 'centos' <<< "$SYS"; then SYSTEM='CentOS'; fi
-  if grep -qi 'alpine' <<< "$SYS"; then SYSTEM='Alpine'; fi
+curl -L -o /tmp/sing-box.tar.gz "$DL_URL"
+tar -xzf /tmp/sing-box.tar.gz -C /tmp
+mv /tmp/sing-box-${LATEST_VER}-linux-${SING_ARCH}/sing-box /usr/local/bin/
+chmod +x /usr/local/bin/sing-box
 
-  SINGBOX_DAEMON_FILE='/etc/systemd/system/sing-box.service'
-  [ "$SYSTEM" = 'Alpine' ] && SINGBOX_DAEMON_FILE='/etc/init.d/sing-box'
-}
+# 4. 生成配置参数与密钥
+UUID=$(cat /proc/sys/kernel/random/uuid)
+HY2_PASS=$(openssl rand -hex 8)
 
-check_arch() {
-  case "$(uname -m)" in
-    aarch64|arm64 ) SING_BOX_ARCH=arm64 ;;
-    x86_64|amd64 ) SING_BOX_ARCH=amd64 ;;
-    * ) error "不支持的架构: $(uname -m)" ;;
-  esac
-}
+# 生成 Reality 密钥对
+KEYPAIR=$(sing-box generate reality-keypair)
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep "PrivateKey" | awk '{print $2}' | tr -d '"')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep "PublicKey" | awk '{print $2}' | tr -d '"')
 
-check_install() {
-  if [ -s ${SINGBOX_DAEMON_FILE} ]; then
-    STATUS="运行中"
-  else
-    STATUS="未安装"
-  fi
-}
+# 为 Hysteria2 生成自签证书
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+  -keyout "${WORK_DIR}/key.pem" \
+  -out "${WORK_DIR}/cert.pem" \
+  -subj "/CN=gateway.icloud.com" 2>/dev/null
 
-uninstall() {
-  if [ -d ${WORK_DIR} ]; then
-    rm -rf ${WORK_DIR} ${TEMP_DIR} /usr/bin/sb
-    if [ "$SYSTEM" = 'Alpine' ]; then
-      rc-service sing-box stop 2>/dev/null
-      rc-update del sing-box 2>/dev/null
-      rm -f /etc/init.d/sing-box
-    else
-      systemctl stop sing-box 2>/dev/null
-      systemctl disable sing-box 2>/dev/null
-      rm -f /etc/systemd/system/sing-box.service
-      systemctl daemon-reload
-    fi
-    info "\n Sing-box 已彻底卸载 \n"
-  else
-    error "\n Sing-box 尚未安装 \n"
-  fi
-}
-
-install_singbox() {
-  info "正在准备安装 Sing-box (双节点: VLESS-Reality + Hysteria2)..."
-  mkdir -p ${WORK_DIR}
-  
-  # 获取系统公网IP
-  SERVER_IP=$(curl -s https://ip.sb || curl -s https://api.ipify.org)
-  hint "检测到当前服务器 IP: ${SERVER_IP}"
-  
-  read -rp "请输入 VLESS-Reality 端口 (默认 8443): " REALITY_PORT
-  REALITY_PORT=${REALITY_PORT:-8443}
-  
-  read -rp "请输入 Hysteria2 端口 (默认 8444): " HY2_PORT
-  HY2_PORT=${HY2_PORT:-8444}
-
-  # 生成 UUID 和 Reality 密钥对
-  UUID=$(cat /proc/sys/kernel/random/uuid)
-  
-  # 下载并安装 sing-box 主程序
-  LATEST_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-  LATEST_VERSION=${LATEST_VERSION:-$DEFAULT_NEWEST_VERSION}
-  
-  DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VERSION}/sing-box-${LATEST_VERSION}-linux-${SING_BOX_ARCH}.tar.gz"
-  info "正在下载 sing-box v${LATEST_VERSION}..."
-  curl -L -o "${TEMP_DIR}/sing-box.tar.gz" "${DOWNLOAD_URL}"
-  
-  tar -xzf "${TEMP_DIR}/sing-box.tar.gz" -C "${TEMP_DIR}"
-  mv ${TEMP_DIR}/sing-box-${LATEST_VERSION}-linux-${SING_BOX_ARCH}/sing-box /usr/local/bin/
-  chmod +x /usr/local/bin/sing-box
-
-  # 生成 Reality 密钥
-  KEYPAIR=$(sing-box generate reality-keypair)
-  PRIVATE_KEY=$(echo "$KEYPAIR" | grep "PrivateKey" | awk '{print $2}' | tr -d '"')
-  PUBLIC_KEY=$(echo "$KEYPAIR" | grep "PublicKey" | awk '{print $2}' | tr -d '"')
-  HY2_PASSWORD=$(openssl rand -hex 8)
-
-  # 写入配置文件
-  cat << EOF > ${WORK_DIR}/config.json
+# 5. 写入配置文件
+cat << EOF > ${WORK_DIR}/config.json
 {
   "log": {
     "level": "info",
@@ -154,9 +94,14 @@ install_singbox() {
       "listen_port": ${HY2_PORT},
       "users": [
         {
-          "password": "${HY2_PASSWORD}"
+          "password": "${HY2_PASS}"
         }
       ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${WORK_DIR}/cert.pem",
+        "key_path": "${WORK_DIR}/key.pem"
+      },
       "masquerade": "https://gateway.icloud.com"
     }
   ],
@@ -169,22 +114,8 @@ install_singbox() {
 }
 EOF
 
-  # 创建系统服务
-  if [ "$SYSTEM" = 'Alpine' ]; then
-    cat << EOF > /etc/init.d/sing-box
-#!/sbin/openrc-run
-name="sing-box"
-description="Sing-box Service"
-command="/usr/local/bin/sing-box"
-command_args="run -c ${WORK_DIR}/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-EOF
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default
-    rc-service sing-box start
-  else
-    cat << EOF > /etc/systemd/system/sing-box.service
+# 6. 配置 Systemd 服务
+cat << EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box service
 After=network.target nss-lookup.target
@@ -201,60 +132,35 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl start sing-box
-  fi
 
-  info "\n==================================================================="
-  info " 安装成功！当前仅包含两个核心节点："
-  info "-------------------------------------------------------------------"
-  echo -e " 1. VLESS-Reality 节点:"
-  echo -e "    - 服务器IP: ${SERVER_IP}"
-  echo -e "    - 端口: ${REALITY_PORT}"
-  echo -e "    - UUID: ${UUID}"
-  echo -e "    - Public Key: ${PUBLIC_KEY}"
-  echo -e "    - 目标域名: gateway.icloud.com"
-  echo -e "-------------------------------------------------------------------"
-  echo -e " 2. Hysteria2 节点:"
-  echo -e "    - 服务器IP: ${SERVER_IP}"
-  echo -e "    - 端口: ${HY2_PORT}"
-  echo -e "    - 密码: ${HY2_PASSWORD}"
-  info "===================================================================\n"
-}
+systemctl daemon-reload
+systemctl enable sing-box
+systemctl restart sing-box
 
-# 主菜单
-menu() {
-  check_root
-  check_system_info
-  check_arch
-  check_install
-
-  clear
-  echo -e "===================================================================\n"
-  info " Sing-box 双节点管理脚本 (VLESS-Reality + Hysteria2)"
-  info " 当前状态: ${STATUS} | 系统: $SYS"
-  echo -e "===================================================================\n"
-  hint " 1. 安装/重置双节点配置"
-  hint " 2. 查看当前节点信息"
-  hint " 9. 卸载 Sing-box"
-  hint " 0. 退出脚本"
-  read -rp "请选择 [0-9]: " CHOOSE
-
-  case "$CHOOSE" in
-    1 ) install_singbox ;;
-    2 ) 
-        if [ -s ${WORK_DIR}/config.json ]; then
-          info "配置文件位于: ${WORK_DIR}/config.json"
-          cat ${WORK_DIR}/config.json
-        else
-          error "未找到配置文件，请先安装！"
-        fi
-        ;;
-    9 ) uninstall ;;
-    0 ) exit 0 ;;
-    * ) warning "输入错误，请重新选择" && sleep 1 && menu ;;
-  esac
-}
-
-menu
+# 7. 优雅输出节点信息与导入链接
+clear
+echo "========================================================================="
+echo "                        🎉 安装配置成功！                                "
+echo "========================================================================="
+echo ""
+echo "-------------------------------------------------------------------------"
+echo " 1. 【VLESS-Reality 节点】"
+echo "-------------------------------------------------------------------------"
+echo " 服务器 IP   : ${SERVER_IP}"
+echo " 端口        : ${REALITY_PORT}"
+echo " UUID        : ${UUID}"
+echo " Public Key  : ${PUBLIC_KEY}"
+echo " SNI         : gateway.icloud.com"
+echo " 📥 导入链接 :"
+echo "vless://${UUID}@${SERVER_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=gateway.icloud.com&fp=chrome&pbk=${PUBLIC_KEY}&type=tcp#vless-reality"
+echo ""
+echo "-------------------------------------------------------------------------"
+echo " 2. 【Hysteria2 节点】"
+echo "-------------------------------------------------------------------------"
+echo " 服务器 IP   : ${SERVER_IP}"
+echo " 端口        : ${HY2_PORT}"
+echo " 密码        : ${HY2_PASS}"
+echo " SNI         : gateway.icloud.com"
+echo " 📥 导入链接 :"
+echo "hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?insecure=1&sni=gateway.icloud.com#hysteria2"
+echo "========================================================================="
