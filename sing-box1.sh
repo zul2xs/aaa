@@ -1,16 +1,21 @@
-#!/bin/bash
+#!/bin/sh
 
 # 确保以 root 权限运行
-[[ $EUID -ne 0 ]] && echo "请使用 root 权限运行此脚本！" && exit 1
+[ "$(id -u)" -ne 0 ] && echo "请使用 root 权限运行此脚本！" && exit 1
 
 CONFIG_FILE="/etc/sing-box/config.json"
-SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
-# 安装 sing-box
+# 安装 sing-box (针对 Alpine 优化)
 install_singbox() {
-    echo "正在安装 sing-box..."
-    apt-get update && apt-get install -y curl wget jq systemd
-    bash <(curl -fsSL https://sing-box.app/deb.sh)
+    echo "正在为 Alpine 配置软件源并安装 sing-box..."
+    
+    # 确保开启 community 源以支持 sing-box
+    if ! grep -q "community" /etc/apk/repositories; then
+        echo "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community" >> /etc/apk/repositories
+    fi
+    
+    apk update
+    apk add --no-cache jq openssl sing-box
     echo "sing-box 安装完成。"
 }
 
@@ -20,14 +25,17 @@ generate_config() {
     echo "      配置 XTLS-Reality & Hysteria2       "
     echo "=========================================="
 
-    # 获取服务器 IP
-    PUBLIC_IP=$(curl -s https://api.ipify.org)
+    # 获取服务器 IP (使用 Alpine 自带的 wget)
+    PUBLIC_IP=$(wget -qO- https://api.ipify.org)
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(hostname -I | awk '{print $1}')
     
     # 1. 配置 VLESS-Reality
-    read -p "请输入 VLESS-Reality 端口 [默认 443]: " REALITY_PORT
+    printf "请输入 VLESS-Reality 端口 [默认 443]: "
+    read REALITY_PORT
     REALITY_PORT=${REALITY_PORT:-443}
     
-    read -p "请输入 Reality 伪装域名 (例如 dl.google.com): " REALITY_SNI
+    printf "请输入 Reality 伪装域名 (例如 dl.google.com): "
+    read REALITY_SNI
     REALITY_SNI=${REALITY_SNI:-dl.google.com}
 
     # 生成 Reality 密钥对
@@ -37,10 +45,12 @@ generate_config() {
     UUID=$(sing-box generate uuid)
 
     # 2. 配置 Hysteria2
-    read -p "请输入 Hysteria2 端口 [默认 8443]: " HY2_PORT
+    printf "请输入 Hysteria2 端口 [默认 8443]: "
+    read HY2_PORT
     HY2_PORT=${HY2_PORT:-8443}
     
-    read -p "请输入 Hysteria2 认证密码: " HY2_PASSWORD
+    printf "请输入 Hysteria2 认证密码: "
+    read HY2_PASSWORD
     HY2_PASSWORD=${HY2_PASSWORD:-$(openssl rand -hex 8)}
 
     # 创建配置目录
@@ -110,14 +120,13 @@ generate_config() {
 }
 EOF
 
-    # 为 Hysteria2 生成自签证书（若没有域名）
+    # 为 Hysteria2 生成自签证书
     openssl ecparam -genkey -name prime256v1 -out /etc/sing-box/cert.key
     openssl req -new -x509 -days 3650 -key /etc/sing-box/cert.key -out /etc/sing-box/cert.crt -subj "/CN=bing.com"
 
-    # 重启并启用服务
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
+    # 使用 Alpine 的 OpenRC 服务管理启动并加入开机自启
+    rc-update add sing-box default
+    rc-service sing-box restart
 
     echo "=========================================="
     echo "              安装配置成功！              "
@@ -142,7 +151,8 @@ EOF
 echo "1. 安装/重置 节点 (VLESS-Reality + Hysteria2)"
 echo "2. 查看节点信息"
 echo "3. 卸载"
-read -p "请选择 [1-3]: " CHOICE
+printf "请选择 [1-3]: "
+read CHOICE
 
 case $CHOICE in
     1)
@@ -157,10 +167,10 @@ case $CHOICE in
         fi
         ;;
     3)
-        systemctl stop sing-box
-        systemctl disable sing-box
+        rc-service sing-box stop
+        rc-update del sing-box
         rm -rf /etc/sing-box
-        apt-get purge -y sing-box
+        apk del sing-box
         echo "已卸载完成。"
         ;;
     *)
